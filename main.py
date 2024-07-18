@@ -1,7 +1,9 @@
+from sched import scheduler
 import torch
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+from torch import nn
 import random
 import numpy as np
 from src.models.evflownet import EVFlowNet
@@ -44,6 +46,16 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
 
+#追加箇所
+def multiscale_loss(flow_dict,gt_flow,loss_fn):
+    total_loss=0
+    for scale,output in flow_dict.items():
+        scaled_gt_flow=nn.functional.interpolate(gt_flow,size=output.shape[2:],mode="bilinear",align_corners=False)
+        total_loss+=loss_fn(output,scaled_gt_flow)
+    return total_loss
+def loss_fn(pred,target):
+    return torch.mean(torch.norm(pred-target,p=2,dim=1))
+
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
     set_seed(args.seed)
@@ -82,12 +94,18 @@ def main(args: DictConfig):
     )
     train_set = loader.get_train_dataset()
     test_set = loader.get_test_dataset()
+    val_set = loader.get_val_dataset()
     collate_fn = train_collate
     train_data = DataLoader(train_set,
                                  batch_size=args.data_loader.train.batch_size,
                                  shuffle=args.data_loader.train.shuffle,
                                  collate_fn=collate_fn,
                                  drop_last=False)
+    val_data = DataLoader(val_set,
+                          batch_size=args.data_loader.val.batch_size,
+                          shuffle=args.data_loader.val.shuffle,
+                          collate_fn=collate_fn,
+                          drop_last=False)
     test_data = DataLoader(test_set,
                                  batch_size=args.data_loader.test.batch_size,
                                  shuffle=args.data_loader.test.shuffle,
@@ -116,40 +134,62 @@ def main(args: DictConfig):
     #   optimizer
     # ------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
     # ------------------
     #   Start training
     # ------------------
     model.train()
     for epoch in range(args.train.epochs):
-        total_loss = 0
-        print("on epoch: {}".format(epoch+1))
+        total_train_loss = 0
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
-            print(f"batch {i} loss: {loss.item()}")
+            event_image = batch["event_volume"].to(device)
+            ground_truth_flow = batch["flow_gt"].to(device)
+            outputs = model(event_image)
+            loss =multiscale_loss(outputs, ground_truth_flow, loss_fn)  # 変更: マルチスケールロスの計算
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            total_train_loss += loss.item()
+        
+        avg_train_loss = total_train_loss / len(train_data)
+        print(f'Epoch {epoch+1}, Train Loss: {avg_train_loss}')
 
-            total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_data:
+                event_image = batch["event_volume"].to(device)
+                ground_truth_flow = batch["flow_gt"].to(device)
+                outputs = model(event_image)
+                val_loss = multiscale_loss(outputs, ground_truth_flow, loss_fn)  # 変更: マルチスケールロスの計算
+                total_val_loss += val_loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_data)
+        print(f'Epoch {epoch+1}, Val Loss: {avg_val_loss}')
+        scheduler.step()
 
-    # Create the directory if it doesn't exist
-    if not os.path.exists('checkpoints'):
-        os.makedirs('checkpoints')
-    
-    current_time = time.strftime("%Y%m%d%H%M%S")
-    model_path = f"checkpoints/model_{current_time}.pth"
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f'New best model saved at epoch {epoch+1}')
+        else:
+            patience_counter += 1
+            print(f'Patience counter: {patience_counter}/{patience}')
+            if patience_counter >= patience:
+                print('Early stopping triggered')
+                break
+
+        model.train()
 
     # ------------------
     #   Start predicting
     # ------------------
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load('best_model.pth', map_location=device))
     model.eval()
     flow: torch.Tensor = torch.tensor([]).to(device)
     with torch.no_grad():
